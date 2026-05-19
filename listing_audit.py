@@ -145,43 +145,132 @@ def load_content(file):
     df=df[(df["Article_No"]!="")&(df["EAN"]!="")]
     return df[["Article_No","EAN","Size"]].drop_duplicates("EAN").reset_index(drop=True)
 
-def load_zecom(file):
-    df=pd.DataFrame()
-    for sh in["PH","MY","SG","Sheet1","Sheet",0]:
+def load_zecom(file, region="PH"):
+    """
+    Region-aware ZeCom loader.
+    PH  → reads sheet "PH",  header row 2, Article No = PIM Article#
+    MY  → reads sheet "MY",  header row 2, Article No = STYLE# (with fallbacks)
+    SG  → reads sheet "SG",  header row 2, Article No = STYLE# (with fallbacks)
+
+    Tracker columns: fuzzy match — any column whose name CONTAINS the
+    marketplace keyword (case-insensitive) is used.
+    Keywords: lazada | shopee | zalora | tiktok
+    """
+    # Region → preferred sheet name
+    sheet_pref = {"PH":"PH","MY":"MY","SG":"SG"}.get(region,"PH")
+
+    df = pd.DataFrame()
+    # Try preferred sheet first, then fallbacks
+    for sh in [sheet_pref, region, "Sheet1", "Sheet", 0]:
         try:
             file.seek(0)
-            tmp=read_file(file,sheet_name=sh,header=2)
-            if len(tmp)>5:df=tmp;break
-        except:continue
+            tmp = read_file(file, sheet_name=sh, header=2)
+            if len(tmp) > 5:
+                df = tmp; break
+        except:
+            continue
     if df.empty:
-        file.seek(0);df=read_file(file,header=2)
-    df=nc(df,["PIM Article#","PIM Article","Article No","ArticleNo","Color_No","ColorNo","Style Number"],"Article_No")
-    for mp,keys in[("Lazada",["LAZADA","Lazada","lazada"]),("Shopee",["SHOPEE","Shopee","shopee"]),
-                    ("Zalora",["ZALORA","Zalora","zalora"]),("TikTok",["TIK TOK","TIKTOK","TikTok","tiktok"])]:
-        df=nc(df,keys,f"Tracker_{mp}")
-    df=nc(df,["Launch Dates","Launch Date","LaunchDate","Go Live"],"Launch_Date")
-    for col in[f"Tracker_{m}"for m in["Lazada","Shopee","Zalora","TikTok"]]+["Launch_Date","Article_No"]:
-        if col not in df.columns:df[col]=np.nan
-    df["Article_No"]=df["Article_No"].apply(_s).astype(str)
-    df["Launch_Date"]=pd.to_datetime(df["Launch_Date"],errors="coerce")
-    df=df[df["Article_No"].str.match(r'^\S+.*\S+$',na=False)&(df["Article_No"].str.len()>2)]
+        file.seek(0); df = read_file(file, header=2)
+
+    # Article No column — STYLE# takes priority for MY/SG, then common fallbacks
+    art_candidates = [
+        "STYLE#","Style#","style#",
+        "PIM Article#","PIM Article","Article No","ArticleNo",
+        "Color_No","ColorNo","Color No","Style Number","StyleNo",
+    ]
+    df = nc(df, art_candidates, "Article_No")
+
+    # Tracker columns — FUZZY: find col whose name contains the keyword
+    MP_KEYWORDS = {
+        "Lazada" : "lazada",
+        "Shopee" : "shopee",
+        "Zalora" : "zalora",
+        "TikTok" : "tiktok",
+    }
+    already_mapped = set()
+    for mp, kw in MP_KEYWORDS.items():
+        target = f"Tracker_{mp}"
+        # Find first column not already mapped whose name contains the keyword
+        match = next(
+            (c for c in df.columns
+             if kw in c.strip().lower().replace(" ","").replace("_","")
+             and c not in already_mapped
+             and c != "Article_No"),
+            None
+        )
+        if match:
+            df = df.rename(columns={match: target})
+            already_mapped.add(target)
+
+    df = nc(df,["Launch Dates","Launch Date","LaunchDate","Go Live","live date"],"Launch_Date")
+
+    for col in [f"Tracker_{m}" for m in ["Lazada","Shopee","Zalora","TikTok"]] + ["Launch_Date","Article_No"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df["Article_No"]  = df["Article_No"].apply(_s).astype(str)
+    df["Launch_Date"] = pd.to_datetime(df["Launch_Date"], errors="coerce")
+    df = df[df["Article_No"].str.match(r'^\S+.*\S+$', na=False) &
+            (df["Article_No"].str.len() > 2)]
     return df.drop_duplicates("Article_No").reset_index(drop=True)
 
-def load_inv(file,region):
-    df=read_file(file)
-    df=nc(df,["EAN","ean","Barcode","barcode","SKU","Material"],"EAN")
-    if"EAN"not in df.columns:
-        return pd.DataFrame(columns=["EAN","Inv_Stock"]),{"error":"EAN not found"}
-    df["EAN"]=df["EAN"].apply(_ean).astype(str)
-    df=df[df["EAN"].str.match(r'^\d{5,}$',na=False)]
-    primary=INV_COL.get(region,"Avail_Qty")
-    sc=primary if primary in df.columns else next((c for c in df.columns if c.strip().lower()==primary.lower()),None)
+# EAN column priority per region (first match wins)
+INV_EAN_COLS = {
+    "PH": ["EAN","ean","Barcode","barcode","SKU","sku","Material"],
+    "MY": ["Sku","SKU","sku","EAN","ean","Barcode","barcode","Material"],
+    "SG": ["PROD_CODE","prod_code","Prod_Code","EAN","ean","Barcode","barcode","SKU","sku"],
+}
+
+def load_inv(file, region):
+    """
+    Region-aware inventory loader.
+    EAN column priority:
+      PH : EAN / Barcode / SKU
+      MY : Sku / SKU / sku / EAN / Barcode
+      SG : PROD_CODE / EAN / Barcode / SKU
+    Stock column:
+      PH : Avail_Qty
+      MY : QtyAvailable
+      SG : QTY
+    """
+    df = read_file(file)
+    all_cols = list(df.columns)
+
+    # Region-specific EAN column candidates
+    ean_cands = INV_EAN_COLS.get(region, INV_EAN_COLS["PH"])
+    df = nc(df, ean_cands, "EAN")
+
+    if "EAN" not in df.columns:
+        st.warning(f"[{region}] Inventory: EAN column not found. "
+                   f"Expected one of: {ean_cands[:4]}. Columns: {all_cols[:10]}")
+        return pd.DataFrame(columns=["EAN","Inv_Stock"]), {"error":"EAN not found"}
+
+    df["EAN"] = df["EAN"].apply(_ean).astype(str)
+    df = df[df["EAN"].str.match(r'^\d{5,}$', na=False)]
+
+    # Stock column
+    primary = INV_COL.get(region, "Avail_Qty")
+    sc = (primary if primary in df.columns else
+          next((c for c in df.columns if c.strip().lower() == primary.lower()), None))
     if not sc:
-        sc=next((c for c in df.columns if c.strip().lower()in["avail_qty","stock per ean","qtyavailable","qty","available","on hand","soh","quantity","stock"]),None)
-        if sc:st.warning(f"[{region}] Inv: using '{sc}' (expected '{primary}')")
-    df["Inv_Stock"]=pd.to_numeric(df[sc],errors="coerce").fillna(0).clip(lower=0).astype(int)if sc else 0
-    dbg={"Used col":sc or"NOT FOUND","EAN rows":len(df),"Non-zero":int((df["Inv_Stock"]>0).sum())}
-    return df[["EAN","Inv_Stock"]].drop_duplicates("EAN").reset_index(drop=True),dbg
+        fallbacks = ["avail_qty","qtyavailable","qty","stock per ean",
+                     "available","on hand","soh","quantity","stock"]
+        sc = next((c for c in df.columns if c.strip().lower() in fallbacks), None)
+        if sc:
+            st.warning(f"[{region}] Inventory: using '{sc}' as stock col (expected '{primary}')")
+        else:
+            st.error(f"[{region}] Inventory: stock column '{primary}' not found. Cols: {all_cols}")
+
+    df["Inv_Stock"] = (pd.to_numeric(df[sc], errors="coerce")
+                       .fillna(0).clip(lower=0).astype(int)) if sc else 0
+    dbg = {
+        "Region"   : region,
+        "EAN col"  : "EAN (from candidates)",
+        "Stock col": sc or "NOT FOUND",
+        "EAN rows" : len(df),
+        "Non-zero" : int((df["Inv_Stock"] > 0).sum()),
+    }
+    return df[["EAN","Inv_Stock"]].drop_duplicates("EAN").reset_index(drop=True), dbg
 
 def _mp(file,mp,sht=None):
     cfg=MP_CFG[mp]
@@ -427,7 +516,7 @@ with tab_up:
                 r=rf2.get(region,{})
                 st.markdown(f"#### {region}")
                 with st.spinner(f"[{region}] ZeCom..."):
-                    zecom_df=load_zecom(r["zecom"])
+                    zecom_df=load_zecom(r["zecom"], region)
                 st.write(f"  ZeCom: {len(zecom_df):,} articles")
                 inv_df=pd.DataFrame(columns=["EAN","Inv_Stock"])
                 if r.get("inv"):
