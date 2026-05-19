@@ -427,7 +427,101 @@ def build_excel(rdata,region):
                 col=TAB_COLORS[cat]
                 ws.write(r,ci+1,cnt,cd(col["bg"],col["fc"]))
             r+=1
-        # Detail sheets
+        # ── Tracker Analysis sheet ───────────────────────────────────────────
+        ws_ta = wb.add_worksheet("Tracker Analysis")
+        writer.sheets["Tracker Analysis"] = ws_ta
+        ws_ta.write(0, 0, f"Tracker Analysis | {region}", ttl)
+        ws_ta.write(1, 0, f"Generated: {datetime.now().strftime('%d %b %Y %H:%M')}", sub)
+
+        def grp_fmt(bg): return F(bold=True,bg_color=bg,font_color="#ffffff",align="center",text_wrap=True,border=1)
+        grp_hdr_f  = grp_fmt("#0f3460")
+        col_hdr_f  = grp_fmt("#1a3a5c")
+        listed_f   = F(bg_color="#c6efce",font_color="#276221")
+        notlist_f  = F(bg_color="#ffc7ce",font_color="#9c0006")
+        yes_f      = F(bg_color="#d6eaf8",font_color="#1a5276")
+        num_f      = F(align="center",border=1)
+
+        # Collect all EANs from all categories across all MPs
+        ean_data = {}
+        for mp in mps:
+            cats = rdata.get(mp,{})
+            for cat_name in ["Already Listed","Add Variant","Full New Listing","No Action Needed"]:
+                df = cats.get(cat_name, pd.DataFrame())
+                if df.empty: continue
+                for _,row in df.iterrows():
+                    ean = str(row.get("Missing EAN","")) if cat_name=="Add Variant" else str(row.get("EAN",""))
+                    if not ean or ean=="nan": continue
+                    art = str(row.get("Article No",""))
+                    ld  = str(row.get("Launch Date","-"))
+                    inv = row.get("Inventory Stock",0)
+                    if ean not in ean_data:
+                        ean_data[ean] = {"Color No":art,"EAN":ean,"Launch Date":ld,"Inv_Stock":inv}
+                        for m in mps:
+                            ean_data[ean][f"Tracker_{m}"] = "-"
+                            ean_data[ean][f"Status_{m}"]  = "Not Listed"
+                            ean_data[ean][f"PID_{m}"]     = ""
+                    ean_data[ean][f"Tracker_{mp}"] = "YES"
+                    if cat_name == "Already Listed":
+                        ean_data[ean][f"Status_{mp}"] = "Listed"
+                        ean_data[ean][f"PID_{mp}"]    = sv(row.get("MP Product ID",""))
+                    elif cat_name in ("Add Variant","Full New Listing"):
+                        ean_data[ean][f"Status_{mp}"] = "Not Listed"
+                    elif cat_name == "No Action Needed":
+                        ean_data[ean][f"Status_{mp}"] = "Listed"
+
+        ta_rows = sorted(ean_data.values(), key=lambda x:(x["Color No"],x["EAN"]))
+        ws_ta.write(1,3,f"Total EANs: {len(ta_rows):,}",sub)
+
+        # Group header row (row 2), column header row (row 3), data from row 4
+        GRP=2; COL=3; DAT=4
+        # Fixed cols
+        ws_ta.write(GRP,0,"Color No",grp_hdr_f); ws_ta.set_column(0,0,16)
+        ws_ta.write(GRP,1,"EAN",grp_hdr_f);      ws_ta.set_column(1,1,18)
+        ws_ta.write(GRP,2,"Launch Date",grp_hdr_f); ws_ta.set_column(2,2,14)
+
+        cc=3
+        # ZeCom Tracker group
+        ws_ta.merge_range(GRP,cc,GRP,cc+len(mps)-1,"ZeCom Tracker",grp_hdr_f)
+        zc_cols={}
+        for mp in mps:
+            ws_ta.write(COL,cc,mp,col_hdr_f); ws_ta.set_column(cc,cc,10); zc_cols[mp]=cc; cc+=1
+
+        # Inventory group
+        ws_ta.merge_range(GRP,cc,GRP,cc,"Inventory",grp_hdr_f)
+        ws_ta.write(COL,cc,"Quantity",col_hdr_f); ws_ta.set_column(cc,cc,12); inv_c=cc; cc+=1
+
+        # Marketplace Status group
+        ws_ta.merge_range(GRP,cc,GRP,cc+len(mps)-1,"Marketplace Status",grp_hdr_f)
+        st_cols={}
+        for mp in mps:
+            ws_ta.write(COL,cc,f"{mp} Status",col_hdr_f); ws_ta.set_column(cc,cc,14); st_cols[mp]=cc; cc+=1
+
+        # Marketplace PID group
+        ws_ta.merge_range(GRP,cc,GRP,cc+len(mps)-1,"Marketplace PID",grp_hdr_f)
+        pid_c={}
+        for mp in mps:
+            ws_ta.write(COL,cc,f"{mp} PID",col_hdr_f); ws_ta.set_column(cc,cc,26); pid_c[mp]=cc; cc+=1
+
+        ws_ta.freeze_panes(DAT,3)
+        ws_ta.set_row(GRP,20); ws_ta.set_row(COL,20)
+
+        # Data
+        for ri,rec in enumerate(ta_rows):
+            r=DAT+ri
+            ws_ta.write(r,0,rec["Color No"],norm)
+            ws_ta.write(r,1,rec["EAN"],norm)
+            ws_ta.write(r,2,rec["Launch Date"],norm)
+            for mp in mps:
+                tr=rec.get(f"Tracker_{mp}","-")
+                ws_ta.write(r,zc_cols[mp],tr,yes_f if tr=="YES" else norm)
+            ws_ta.write_number(r,inv_c,int(rec.get("Inv_Stock",0)),num_f)
+            for mp in mps:
+                st=rec.get(f"Status_{mp}","Not Listed")
+                ws_ta.write(r,st_cols[mp],st,listed_f if st=="Listed" else notlist_f)
+            for mp in mps:
+                ws_ta.write(r,pid_c[mp],str(rec.get(f"PID_{mp}",""))or"",norm)
+
+        # ── Detail sheets ────────────────────────────────────────────────────
         num_cols={"Inventory Stock","MP Stock","Total EANs","In-Stock EANs",
                   "Listed EANs","Already Listed","Total In-Stock"}
         for mp in mps:
