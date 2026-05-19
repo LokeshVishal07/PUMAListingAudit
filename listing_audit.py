@@ -148,29 +148,29 @@ def load_content(file):
 def load_zecom(file, region="PH"):
     """
     Region-aware ZeCom loader.
-    PH  → reads sheet "PH",  header row 2, Article No = PIM Article#
-    MY  → reads sheet "MY",  header row 2, Article No = STYLE# (with fallbacks)
-    SG  → reads sheet "SG",  header row 2, Article No = STYLE# (with fallbacks)
+    PH  → sheet "PH",  header row 2, Article col = PIM Article#
+    MY  → sheet "MY",  header row 3, Article col = Style#
+    SG  → sheet "SG",  header row 3, Article col = STYLE#
 
-    Tracker columns: fuzzy match — any column whose name CONTAINS the
-    marketplace keyword (case-insensitive) is used.
+    Tracker columns: fuzzy match on column name containing keyword
+    (case-insensitive, ignores spaces/underscores).
     Keywords: lazada | shopee | zalora | tiktok
     """
-    # Region → preferred sheet name
     sheet_pref = {"PH":"PH","MY":"MY","SG":"SG"}.get(region,"PH")
+    # MY/SG confirmed header row = 3; PH = 2
+    hdr_row = 2 if region == "PH" else 3
 
     df = pd.DataFrame()
-    # Try preferred sheet first, then fallbacks
     for sh in [sheet_pref, region, "Sheet1", "Sheet", 0]:
         try:
             file.seek(0)
-            tmp = read_file(file, sheet_name=sh, header=2)
+            tmp = read_file(file, sheet_name=sh, header=hdr_row)
             if len(tmp) > 5:
                 df = tmp; break
         except:
             continue
     if df.empty:
-        file.seek(0); df = read_file(file, header=2)
+        file.seek(0); df = read_file(file, header=hdr_row)
 
     # Article No column — STYLE# takes priority for MY/SG, then common fallbacks
     art_candidates = [
@@ -232,8 +232,13 @@ def load_inv(file, region):
       PH : Avail_Qty
       MY : QtyAvailable
       SG : QTY
+    Header row:
+      PH / MY : 0 (standard)
+      SG      : 4 (confirmed from file inspection)
     """
-    df = read_file(file)
+    # SG inventory has 4 metadata rows before headers
+    hdr = 4 if region == "SG" else 0
+    df = read_file(file, header=hdr)
     all_cols = list(df.columns)
 
     # Region-specific EAN column candidates
