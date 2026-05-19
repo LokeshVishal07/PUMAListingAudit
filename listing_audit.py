@@ -302,20 +302,29 @@ def load_tiktok(f):return _mp(f,"TikTok")
 def load_zalora(sf,stf):
     ds=read_file(sf,sheet_name="ProductStatuses")
     dk=read_file(stf,sheet_name="Sheet")
+    # EAN = SellerSku, PID = ShopSku
     ds=nc(ds,["SellerSku","SellerSKU","Seller SKU"],"EAN")
+    ds=nc(ds,["ShopSku","shopsku","Shop SKU","ShopSKU"],"MP_ID")
     ds=nc(ds,["Status","status"],"MP_Status")
     dk=nc(dk,["SellerSku","SellerSKU","Seller SKU"],"EAN")
     dk=nc(dk,["Quantity","Stock","Available","Qty"],"MP_Stock")
+    # Also grab ShopSku from stock file as backup
+    dk=nc(dk,["ShopSku","shopsku","Shop SKU","ShopSKU"],"ShopSku_stk")
     for col in["EAN","MP_Status"]:
         if col not in ds.columns:ds[col]=np.nan
+    if"MP_ID"not in ds.columns:ds["MP_ID"]=""
     if"EAN"not in dk.columns:dk["EAN"]=np.nan
     if"MP_Stock"not in dk.columns:dk["MP_Stock"]=0
+    if"ShopSku_stk"not in dk.columns:dk["ShopSku_stk"]=""
     ds["EAN"]=ds["EAN"].apply(_ean).astype(str)
     dk["EAN"]=dk["EAN"].apply(_ean).astype(str)
     ds["MP_Status"]=ds["MP_Status"].apply(_s)
-    m=ds.merge(dk[["EAN","MP_Stock"]].drop_duplicates("EAN"),on="EAN",how="left")
+    ds["MP_ID"]=ds["MP_ID"].apply(_s)
+    m=ds.merge(dk[["EAN","MP_Stock","ShopSku_stk"]].drop_duplicates("EAN"),on="EAN",how="left")
     m["MP_Stock"]=m["MP_Stock"].apply(_i)
-    m["MP_ID"]=""
+    # Fill MP_ID from stock file if missing in status file
+    m["MP_ID"]=m.apply(
+        lambda r: r["MP_ID"] if r["MP_ID"] else _s(str(r.get("ShopSku_stk",""))),axis=1)
     m["Marketplace"]="Zalora"
     m["EAN"]=m["EAN"].astype(str)
     m=m[m["EAN"].str.match(r'^\d{8,}$',na=False)]
