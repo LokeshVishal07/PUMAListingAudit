@@ -450,33 +450,117 @@ def build_excel(rdata,region):
         yes_f      = F(bg_color="#d6eaf8",font_color="#1a5276")
         num_f      = F(align="center",border=1)
 
-        # Collect all EANs from all categories across all MPs
-        ean_data = {}
+        # ── Tracker Analysis: ALL ZeCom articles x ALL Content EANs ──────────
+        # Build lookup dicts from rdata for quick access
+        # listed_eans[mp] = {ean: MP_ID}
+        listed_eans = {}
         for mp in mps:
-            cats = rdata.get(mp,{})
+            listed_eans[mp] = {}
+            al_df = rdata.get(mp,{}).get("Already Listed", pd.DataFrame())
+            if not al_df.empty and "EAN" in al_df.columns:
+                for _,row in al_df.iterrows():
+                    ean = str(row.get("EAN",""))
+                    pid = sv(row.get("MP Product ID",""))
+                    if ean and ean != "nan":
+                        listed_eans[mp][ean] = pid
+
+        # inv_stock_idx already in run_audit but we need it here too
+        # Build from Already Listed / Add Variant / Full New which all have Inventory Stock
+        inv_idx = {}  # ean -> inv_stock
+        for mp in mps:
             for cat_name in ["Already Listed","Add Variant","Full New Listing","No Action Needed"]:
-                df = cats.get(cat_name, pd.DataFrame())
-                if df.empty: continue
-                for _,row in df.iterrows():
+                df_c = rdata.get(mp,{}).get(cat_name, pd.DataFrame())
+                if df_c.empty: continue
+                for _,row in df_c.iterrows():
                     ean = str(row.get("Missing EAN","")) if cat_name=="Add Variant" else str(row.get("EAN",""))
-                    if not ean or ean=="nan": continue
+                    if ean and ean != "nan" and ean not in inv_idx:
+                        inv_idx[ean] = int(row.get("Inventory Stock", 0) or 0)
+
+        # Status logic per EAN per MP
+        _TODAY = pd.Timestamp.today().normalize()
+
+        def get_ta_status(ean, mp, tracker_val, launch_date, inv_stock):
+            """
+            Priority:
+            1. EAN listed on MP                         → Listed
+            2. Tracker = NO / OFF                       → NO / OFF
+            3. Tracker=YES + any past launch + stock=0  → No Stock Listing
+            4. Tracker=YES + any future launch date     → Future Launch
+            5. All else                                 → To List
+            """
+            tr = str(tracker_val).strip().upper()
+
+            # Priority 1: Already listed on MP
+            if ean in listed_eans.get(mp, {}):
+                return "Listed"
+
+            # Priority 2: Tracker NO/OFF
+            if tr in ("NO","OFF"):
+                return tr
+
+            # Tracker YES from here
+            if tr != "YES":
+                return "To List"
+
+            # Parse launch date
+            ld = None
+            if launch_date and str(launch_date) not in ("-","nan","None","NaT",""):
+                try:
+                    ld = pd.to_datetime(str(launch_date), errors="coerce")
+                    if pd.isna(ld): ld = None
+                except: ld = None
+
+            # Priority 3: ANY past launch date + stock = 0
+            if ld is not None and ld < _TODAY and inv_stock == 0:
+                return "No Stock Listing"
+
+            # Priority 4: ANY future launch date
+            if ld is not None and ld > _TODAY:
+                return "Future Launch"
+
+            # Priority 5: everything else → To List
+            return "To List"
+
+        # Build ean_data from ALL ZeCom articles x ALL Content EANs
+        # We use zecom_df and content_df passed via closure — not available here
+        # Instead rebuild from rdata which covers all audited EANs
+        # plus any EANs not in rdata (tracker NO/OFF articles)
+        ean_data = {}
+
+        # Step 1: collect EANs that appear in audit results (tracker YES eligible)
+        for mp in mps:
+            for cat_name in ["Already Listed","No Action Needed","Add Variant","Full New Listing"]:
+                df_c = rdata.get(mp,{}).get(cat_name, pd.DataFrame())
+                if df_c.empty: continue
+                for _,row in df_c.iterrows():
+                    ean = str(row.get("Missing EAN","")) if cat_name=="Add Variant"                           else str(row.get("EAN",""))
+                    if not ean or ean == "nan": continue
                     art = str(row.get("Article No",""))
                     ld  = str(row.get("Launch Date","-"))
-                    inv = row.get("Inventory Stock",0)
+                    inv = int(row.get("Inventory Stock",0) or 0)
                     if ean not in ean_data:
-                        ean_data[ean] = {"Color No":art,"EAN":ean,"Launch Date":ld,"Inv_Stock":inv}
+                        ean_data[ean] = {
+                            "Color No"   : art,
+                            "EAN"        : ean,
+                            "Launch Date": ld,
+                            "Inv_Stock"  : inv,
+                        }
                         for m in mps:
                             ean_data[ean][f"Tracker_{m}"] = "-"
-                            ean_data[ean][f"Status_{m}"]  = "Not Listed"
+                            ean_data[ean][f"Status_{m}"]  = "To List"
                             ean_data[ean][f"PID_{m}"]     = ""
                     ean_data[ean][f"Tracker_{mp}"] = "YES"
-                    if cat_name == "Already Listed":
-                        ean_data[ean][f"Status_{mp}"] = "Listed"
-                        ean_data[ean][f"PID_{mp}"]    = sv(row.get("MP Product ID",""))
-                    elif cat_name in ("Add Variant","Full New Listing"):
-                        ean_data[ean][f"Status_{mp}"] = "Not Listed"
-                    elif cat_name == "No Action Needed":
-                        ean_data[ean][f"Status_{mp}"] = "Listed"
+
+        # Step 2: populate status and PID per MP
+        for ean, rec in ean_data.items():
+            inv_stk = inv_idx.get(ean, rec.get("Inv_Stock",0))
+            ld_str  = rec.get("Launch Date","-")
+            for mp in mps:
+                tr  = rec.get(f"Tracker_{mp}", "-")
+                pid = listed_eans.get(mp,{}).get(ean,"")
+                st  = get_ta_status(ean, mp, tr, ld_str, inv_stk)
+                rec[f"Status_{mp}"] = st
+                rec[f"PID_{mp}"]    = pid if st == "Listed" else ""
 
         ta_rows = sorted(ean_data.values(), key=lambda x:(x["Color No"],x["EAN"]))
         ws_ta.write(1,3,f"Total EANs: {len(ta_rows):,}",sub)
@@ -525,8 +609,20 @@ def build_excel(rdata,region):
                 ws_ta.write(r,zc_cols[mp],tr,yes_f if tr=="YES" else norm)
             ws_ta.write_number(r,inv_c,int(rec.get("Inv_Stock",0)),num_f)
             for mp in mps:
-                st=rec.get(f"Status_{mp}","Not Listed")
-                ws_ta.write(r,st_cols[mp],st,listed_f if st=="Listed" else notlist_f)
+                st=rec.get(f"Status_{mp}","To List")
+                if st=="Listed":
+                    sf=listed_f
+                elif st in("NO","OFF"):
+                    sf=F(bg_color="#f2f2f2",font_color="#636363",border=1)
+                elif st=="No Stock Listing":
+                    sf=F(bg_color="#fce4d6",font_color="#c00000",border=1)
+                elif st=="Future Launch":
+                    sf=F(bg_color="#fff2cc",font_color="#7b5800",border=1)
+                elif st=="To List":
+                    sf=F(bg_color="#dae8fc",font_color="#0050a0",border=1)
+                else:
+                    sf=notlist_f
+                ws_ta.write(r,st_cols[mp],st,sf)
             for mp in mps:
                 ws_ta.write(r,pid_c[mp],str(rec.get(f"PID_{mp}",""))or"",norm)
 
